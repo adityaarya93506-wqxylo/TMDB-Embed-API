@@ -1,6 +1,3 @@
-// apiServer.js
-// ─── TMDB-Embed-API with Multi-Audio Priority Sorting ───
-
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -12,12 +9,10 @@ const { listProviders, getProvider, getCookieStats } = require('./providers/regi
 const { createProxyRoutes, processStreamsForProxy } = require('./proxy/proxyServer');
 const { resolveImdbId } = require('./utils/tmdb');
 const { applyFilters } = require('./utils/streamFilters');
-const { sortStreamsByPriority } = require('./utils/audioUtils');
 
 const app = express();
 app.set('trust proxy', 1);
 
-// Conditionally mount proxy routes early so downstream handlers can use them
 if (config.enableProxy) {
   console.log('[startup] enableProxy flag active: mounting proxy routes');
   createProxyRoutes(app);
@@ -25,7 +20,6 @@ if (config.enableProxy) {
   console.log('[startup] enableProxy flag disabled: proxy routes not mounted');
 }
 
-// --- Simple In-Memory Rate Limiting for /auth/login ---
 const loginAttempts = new Map();
 const MAX_ATTEMPTS_WINDOW = 5;
 const WINDOW_MS = 10 * 60 * 1000;
@@ -76,7 +70,6 @@ function recordLoginSuccess(ip){
   loginAttempts.delete(ip);
 }
 
-// Guard against premature process.exit from imported legacy modules
 const realProcessExit = process.exit.bind(process);
 let allowControlledExit = false;
 process.exit = function(code){
@@ -87,7 +80,6 @@ setImmediate(()=>console.log('[diagnostic] post-start setImmediate fired'));
 app.use(cors());
 app.use(express.json());
 
-// --- Auth Routes ---
 app.post('/auth/login', (req,res) => {
   const { username, password } = req.body || {};
   const ip = getClientIp(req);
@@ -170,7 +162,6 @@ setInterval(()=>{
   }
 }, 10_000).unref();
 
-// --- Metrics ---
 const metrics = {
   startTime: Date.now(),
   requestsTotal: 0,
@@ -185,7 +176,6 @@ const metrics = {
 app.use((req,res,next)=>{ metrics.requestsTotal++; metrics.lastRequestAt = Date.now(); next(); });
 app.use(express.static(path.join(process.cwd(),'public')));
 
-// Config API
 app.get('/api/config', (req,res) => {
   const fs = require('fs');
   let override = {};
@@ -203,7 +193,6 @@ app.post('/api/config', (req,res) => {
   res.json({ success: ok, merged: config });
 });
 
-// Restart endpoint
 app.post('/api/restart', (req,res) => {
   const sess = getSession(req);
   if(!sess) return res.status(401).json({ success:false, error:'UNAUTHORIZED' });
@@ -223,7 +212,6 @@ app.post('/api/restart', (req,res) => {
   }, 300);
 });
 
-// --- Basic informational endpoints ---
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, service: 'tmdb-embed-api', time: new Date().toISOString() });
 });
@@ -302,9 +290,6 @@ app.get('/api/providers/:name', (req,res) => {
   res.json({ success:true, provider:{ name: p.name, enabled: p.enabled } });
 });
 
-// ═══════════════════════════════════════════════════════════
-//   AGGREGATE STREAMS — with Multi-Audio Priority Sorting
-// ═══════════════════════════════════════════════════════════
 app.get('/api/streams/:type/:tmdbId', async (req,res) => {
   const { type, tmdbId } = req.params;
   if (!['movie','series'].includes(type)) return res.status(400).json({ success:false, error:'INVALID_TYPE' });
@@ -335,38 +320,19 @@ app.get('/api/streams/:type/:tmdbId', async (req,res) => {
     }));
     let streams = results.flat();
     streams = applyFilters(streams, 'aggregate', config.minQualities, config.excludeCodecs);
-
-    // 🎯 MULTI-AUDIO PRIORITY SORT — NetMirror/Vidlink सबसे ऊपर
-    streams = sortStreamsByPriority(streams);
-
     metrics.streamsReturned += streams.length;
     if (config.enableProxy) {
       const serverUrl = `${req.protocol}://${req.get('host')}`;
       streams = processStreamsForProxy(streams, serverUrl);
       streams = streams.map(s => { if (s && typeof s === 'object') { const { headers, ...rest } = s; return rest; } return s; });
     }
-
-    // 🎯 Multi-audio availability flag
-    const multiAudioAvailable = streams.some(s => s && s.audioSupport === 'multi');
-
-    res.json({
-      success:true,
-      tmdbId,
-      imdbId,
-      count: streams.length,
-      multiAudioAvailable,
-      providerTimings,
-      streams
-    });
+    res.json({ success:true, tmdbId, imdbId, count: streams.length, providerTimings, streams });
   } catch (e) {
     metrics.lastError = e.message;
     res.status(500).json({ success:false, error:'INTERNAL_ERROR', message:e.message });
   }
 });
 
-// ═══════════════════════════════════════════════════════════
-//   PROVIDER-SPECIFIC STREAMS — with Multi-Audio Priority Sorting
-// ═══════════════════════════════════════════════════════════
 app.get('/api/streams/:provider/:type/:tmdbId', async (req,res) => {
   const { provider, type, tmdbId } = req.params;
   if (!['movie','series'].includes(type)) return res.status(400).json({ success:false, error:'INVALID_TYPE' });
@@ -384,29 +350,13 @@ app.get('/api/streams/:provider/:type/:tmdbId', async (req,res) => {
     let streams = await prov.fetch({ tmdbId, type, season, episode, imdbId, filters:{} });
     const providerTimings = { [prov.name]: Date.now()-t0 };
     streams = applyFilters(streams, prov.name, config.minQualities, config.excludeCodecs);
-
-    // 🎯 MULTI-AUDIO PRIORITY SORT
-    streams = sortStreamsByPriority(streams);
-
     metrics.streamsReturned += streams.length;
     if (config.enableProxy) {
       const serverUrl = `${req.protocol}://${req.get('host')}`;
       streams = processStreamsForProxy(streams, serverUrl);
       streams = streams.map(s => { if (s && typeof s === 'object') { const { headers, ...rest } = s; return rest; } return s; });
     }
-
-    const multiAudioAvailable = streams.some(s => s && s.audioSupport === 'multi');
-
-    res.json({
-      success:true,
-      provider: prov.name,
-      tmdbId,
-      imdbId,
-      count: streams.length,
-      multiAudioAvailable,
-      providerTimings,
-      streams
-    });
+    res.json({ success:true, provider: prov.name, tmdbId, imdbId, count: streams.length, providerTimings, streams });
   } catch (e) {
     metrics.lastError = e.message;
     res.status(500).json({ success:false, error:'INTERNAL_ERROR', message:e.message });
