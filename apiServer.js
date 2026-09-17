@@ -1,3 +1,6 @@
+// apiServer.js
+// ─── TMDB-Embed-API with Multi-Audio Priority Sorting ───
+
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -9,6 +12,7 @@ const { listProviders, getProvider, getCookieStats } = require('./providers/regi
 const { createProxyRoutes, processStreamsForProxy } = require('./proxy/proxyServer');
 const { resolveImdbId } = require('./utils/tmdb');
 const { applyFilters } = require('./utils/streamFilters');
+const { sortStreamsByPriority } = require('./utils/audioUtils');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -22,10 +26,10 @@ if (config.enableProxy) {
 }
 
 // --- Simple In-Memory Rate Limiting for /auth/login ---
-const loginAttempts = new Map(); // key: ip, value: { count, first, last, lockedUntil }
-const MAX_ATTEMPTS_WINDOW = 5; // attempts allowed
-const WINDOW_MS = 10 * 60 * 1000; // 10 minutes window
-const BASE_LOCK_MS = 5 * 60 * 1000; // 5 minutes base lock
+const loginAttempts = new Map();
+const MAX_ATTEMPTS_WINDOW = 5;
+const WINDOW_MS = 10 * 60 * 1000;
+const BASE_LOCK_MS = 5 * 60 * 1000;
 
 function getClientIp(req){
   return (req.headers['x-forwarded-for'] || req.connection.remoteAddress || '').split(',')[0].trim();
@@ -39,7 +43,6 @@ function recordLoginFailure(ip){
     loginAttempts.set(ip, entry);
     return entry;
   }
-  // Reset window if outside timeframe and not locked
   if (now - entry.first > WINDOW_MS && now > entry.lockedUntil) {
     entry.count = 1;
     entry.first = now;
@@ -48,7 +51,6 @@ function recordLoginFailure(ip){
   }
   entry.last = now;
   if (entry.count > MAX_ATTEMPTS_WINDOW) {
-    // Exponential backoff lock: base * 2^(count - limit)
     const over = entry.count - MAX_ATTEMPTS_WINDOW;
     const lockMs = BASE_LOCK_MS * Math.min(8, Math.pow(2, over-1));
     entry.lockedUntil = now + lockMs;
@@ -64,7 +66,6 @@ function canAttempt(ip){
     return { allowed:false, retryAfter: Math.ceil((entry.lockedUntil - now)/1000) };
   }
   if (now - entry.first > WINDOW_MS) {
-    // Window passed; reset
     loginAttempts.delete(ip);
     return { allowed:true };
   }
@@ -72,23 +73,21 @@ function canAttempt(ip){
 }
 
 function recordLoginSuccess(ip){
-  // On success clear state to avoid lingering count
   loginAttempts.delete(ip);
 }
 
-// Guard against premature process.exit from imported legacy modules, but allow controlled restarts
+// Guard against premature process.exit from imported legacy modules
 const realProcessExit = process.exit.bind(process);
 let allowControlledExit = false;
 process.exit = function(code){
   if (allowControlledExit) return realProcessExit(code);
   console.warn('[diagnostic] Intercepted process.exit with code', code, new Error('exit trace').stack);
-  // keep process alive for debugging
 };
 setImmediate(()=>console.log('[diagnostic] post-start setImmediate fired'));
 app.use(cors());
 app.use(express.json());
 
-// --- Auth Routes (login before static serving) ---
+// --- Auth Routes ---
 app.post('/auth/login', (req,res) => {
   const { username, password } = req.body || {};
   const ip = getClientIp(req);
@@ -134,7 +133,6 @@ app.post('/auth/change-password', requireAuth, (req,res) => {
   res.json({ success:true, message:'PASSWORD_UPDATED' });
 });
 
-// Protect config panel (HTML) explicitly before static middleware
 app.get('/config.html', (req,res,next) => {
   const sess = getSession(req);
   if (!sess) return res.redirect(302, '/');
@@ -144,7 +142,6 @@ app.get('/config.html', (req,res,next) => {
   res.sendFile(path.join(process.cwd(),'public','config.html'));
 });
 
-// Explicit root handler for login page to ensure no-store
 app.get('/', (req,res) => {
   res.setHeader('Cache-Control','no-store, must-revalidate');
   res.setHeader('Pragma','no-cache');
@@ -152,7 +149,6 @@ app.get('/', (req,res) => {
   res.sendFile(path.join(process.cwd(),'public','index.html'));
 });
 
-// Diagnostics for unexpected exits
 process.on('beforeExit', (code) => {
   console.log('[diagnostic] beforeExit code=', code);
 });
@@ -165,17 +161,16 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (reason) => {
   console.error('[diagnostic] unhandledRejection', reason);
 });
-// Periodic heartbeat to confirm event loop activity (can be removed later)
+
 let hbCount = 0;
 setInterval(()=>{
   hbCount++;
-  if (hbCount % 6 === 0) { // every 60s if interval is 10s
+  if (hbCount % 6 === 0) {
     console.log('[diagnostic] heartbeat 60s elapsed, process alive');
   }
 }, 10_000).unref();
 
-
-// --- Metrics (in-memory) ---
+// --- Metrics ---
 const metrics = {
   startTime: Date.now(),
   requestsTotal: 0,
@@ -188,16 +183,13 @@ const metrics = {
 };
 
 app.use((req,res,next)=>{ metrics.requestsTotal++; metrics.lastRequestAt = Date.now(); next(); });
-// Serve static UI (login page at /)
 app.use(express.static(path.join(process.cwd(),'public')));
 
 // Config API
 app.get('/api/config', (req,res) => {
   const fs = require('fs');
   let override = {};
-  try { if (fs.existsSync(OVERRIDE_PATH)) override = JSON.parse(fs.readFileSync(OVERRIDE_PATH,'utf8')); } catch (e) {
-    // ignore JSON parse or fs errors reading override; return base config
-  }
+  try { if (fs.existsSync(OVERRIDE_PATH)) override = JSON.parse(fs.readFileSync(OVERRIDE_PATH,'utf8')); } catch (e) {}
   res.json({ success:true, merged: config, override, overridePath: OVERRIDE_PATH });
 });
 app.post('/api/config', (req,res) => {
@@ -211,12 +203,11 @@ app.post('/api/config', (req,res) => {
   res.json({ success: ok, merged: config });
 });
 
-// Restart endpoint (requires auth via session cookie on /config.html UI)
+// Restart endpoint
 app.post('/api/restart', (req,res) => {
   const sess = getSession(req);
   if(!sess) return res.status(401).json({ success:false, error:'UNAUTHORIZED' });
   res.json({ success:true, message:'RESTARTING' });
-  // Give the response a moment to flush
   setTimeout(()=>{
     try {
       const fs = require('fs');
@@ -227,7 +218,6 @@ app.post('/api/restart', (req,res) => {
       console.warn('[control] failed to write restart marker:', e.message);
     }
     console.warn('[control] restarting process by exit(0)');
-    // Let nodemon detect the file change and restart the app
     allowControlledExit = true;
     realProcessExit(0);
   }, 300);
@@ -238,7 +228,6 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true, service: 'tmdb-embed-api', time: new Date().toISOString() });
 });
 
-// Metrics endpoint
 app.get('/api/metrics', (req,res) => {
   res.json({
     uptimeSeconds: Math.round((Date.now()-metrics.startTime)/1000),
@@ -261,7 +250,6 @@ app.get('/api/metrics', (req,res) => {
   });
 });
 
-// Consolidated status (metrics + providers + endpoints)
 app.get('/api/status', (req,res) => {
   const endpoints = [
     'GET /api/health',
@@ -274,7 +262,6 @@ app.get('/api/status', (req,res) => {
     'POST /api/config',
     'GET /api/config'
   ];
-  // Determine cookie requirement heuristically (currently Showbox / PStream)
   const cookieRequiredProviders = new Set(['showbox']);
   const providers = listProviders().map(p => {
     const cookieRequired = cookieRequiredProviders.has(p.name);
@@ -293,12 +280,10 @@ app.get('/api/status', (req,res) => {
   }, endpoints, providers });
 });
 
-// Providers list
 app.get('/api/providers', (req,res) => {
   res.json({ success: true, providers: listProviders() });
 });
 
-// Debug environment/config endpoint (do not expose publicly in production)
 app.get('/api/debug/env', (req,res) => {
   const cookieStats = getCookieStats ? getCookieStats() : null;
   res.json({
@@ -311,14 +296,15 @@ app.get('/api/debug/env', (req,res) => {
   });
 });
 
-// Single provider info
 app.get('/api/providers/:name', (req,res) => {
   const p = getProvider(req.params.name);
   if (!p) return res.status(404).json({ success:false, error:'PROVIDER_NOT_FOUND' });
   res.json({ success:true, provider:{ name: p.name, enabled: p.enabled } });
 });
 
-// Aggregate streams across all enabled providers
+// ═══════════════════════════════════════════════════════════
+//   AGGREGATE STREAMS — with Multi-Audio Priority Sorting
+// ═══════════════════════════════════════════════════════════
 app.get('/api/streams/:type/:tmdbId', async (req,res) => {
   const { type, tmdbId } = req.params;
   if (!['movie','series'].includes(type)) return res.status(400).json({ success:false, error:'INVALID_TYPE' });
@@ -349,21 +335,38 @@ app.get('/api/streams/:type/:tmdbId', async (req,res) => {
     }));
     let streams = results.flat();
     streams = applyFilters(streams, 'aggregate', config.minQualities, config.excludeCodecs);
+
+    // 🎯 MULTI-AUDIO PRIORITY SORT — NetMirror/Vidlink सबसे ऊपर
+    streams = sortStreamsByPriority(streams);
+
     metrics.streamsReturned += streams.length;
     if (config.enableProxy) {
       const serverUrl = `${req.protocol}://${req.get('host')}`;
       streams = processStreamsForProxy(streams, serverUrl);
-      // Omit original headers when proxying to avoid leaking upstream requirements
       streams = streams.map(s => { if (s && typeof s === 'object') { const { headers, ...rest } = s; return rest; } return s; });
     }
-    res.json({ success:true, tmdbId, imdbId, count: streams.length, providerTimings, streams });
+
+    // 🎯 Multi-audio availability flag
+    const multiAudioAvailable = streams.some(s => s && s.audioSupport === 'multi');
+
+    res.json({
+      success:true,
+      tmdbId,
+      imdbId,
+      count: streams.length,
+      multiAudioAvailable,
+      providerTimings,
+      streams
+    });
   } catch (e) {
     metrics.lastError = e.message;
     res.status(500).json({ success:false, error:'INTERNAL_ERROR', message:e.message });
   }
 });
 
-// Provider-specific streams
+// ═══════════════════════════════════════════════════════════
+//   PROVIDER-SPECIFIC STREAMS — with Multi-Audio Priority Sorting
+// ═══════════════════════════════════════════════════════════
 app.get('/api/streams/:provider/:type/:tmdbId', async (req,res) => {
   const { provider, type, tmdbId } = req.params;
   if (!['movie','series'].includes(type)) return res.status(400).json({ success:false, error:'INVALID_TYPE' });
@@ -381,13 +384,29 @@ app.get('/api/streams/:provider/:type/:tmdbId', async (req,res) => {
     let streams = await prov.fetch({ tmdbId, type, season, episode, imdbId, filters:{} });
     const providerTimings = { [prov.name]: Date.now()-t0 };
     streams = applyFilters(streams, prov.name, config.minQualities, config.excludeCodecs);
+
+    // 🎯 MULTI-AUDIO PRIORITY SORT
+    streams = sortStreamsByPriority(streams);
+
     metrics.streamsReturned += streams.length;
     if (config.enableProxy) {
       const serverUrl = `${req.protocol}://${req.get('host')}`;
       streams = processStreamsForProxy(streams, serverUrl);
       streams = streams.map(s => { if (s && typeof s === 'object') { const { headers, ...rest } = s; return rest; } return s; });
     }
-    res.json({ success:true, provider: prov.name, tmdbId, imdbId, count: streams.length, providerTimings, streams });
+
+    const multiAudioAvailable = streams.some(s => s && s.audioSupport === 'multi');
+
+    res.json({
+      success:true,
+      provider: prov.name,
+      tmdbId,
+      imdbId,
+      count: streams.length,
+      multiAudioAvailable,
+      providerTimings,
+      streams
+    });
   } catch (e) {
     metrics.lastError = e.message;
     res.status(500).json({ success:false, error:'INTERNAL_ERROR', message:e.message });
