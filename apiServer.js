@@ -397,6 +397,14 @@ app.get('/api/selftest', async (req,res) => {
       const prov = getProvider(name);
       if (!prov) return { provider: name, ok:false, count:0, error:'PROVIDER_NOT_FOUND' };
       const t0 = Date.now();
+      // Sirf ek provider (?provider=x) test ho raha ho to uske console logs pakad ke result me do (kyun fail hua)
+      const capture = names.length === 1;
+      const logs = [];
+      const saved = capture ? { log: console.log, warn: console.warn, error: console.error } : null;
+      if (capture) {
+        const grab = (lvl) => (...a) => { if (logs.length < 60) logs.push(`${lvl} ` + a.map(x => (x instanceof Error ? x.message : typeof x === 'string' ? x : JSON.stringify(x))).join(' ').slice(0, 300)); saved[lvl]?.apply(console, a); };
+        console.log = grab('log'); console.warn = grab('warn'); console.error = grab('error');
+      }
       try {
         const r = await withTimeout(prov.fetch({ tmdbId, type, season, episode, imdbId, filters:{} }), hardMsFor(name), name);
         const list = Array.isArray(r) ? r : [];
@@ -404,16 +412,19 @@ app.get('/api/selftest', async (req,res) => {
         list.forEach(s => { const k = s.container === 'mkv' ? 'mkv' : (s.type || 'unknown'); byType[k] = (byType[k]||0)+1; });
         let sample = null;
         if (list[0]) { try { sample = { host: new URL(list[0].url).hostname, type: list[0].type || null, resolution: list[0].resolution || null, hasHeaders: Object.keys(list[0].headers || {}).length > 0 }; } catch { sample = null; } }
-        return { provider: name, ok: list.length > 0, count: list.length, ms: Date.now()-t0, byType, sample };
+        return { provider: name, ok: list.length > 0, count: list.length, ms: Date.now()-t0, byType, sample, ...(capture ? { logs } : {}) };
       } catch (e) {
-        return { provider: name, ok:false, count:0, ms: Date.now()-t0, error: e.message };
+        return { provider: name, ok:false, count:0, ms: Date.now()-t0, error: e.message, ...(capture ? { logs } : {}) };
+      } finally {
+        if (saved) { console.log = saved.log; console.warn = saved.warn; console.error = saved.error; }
       }
     }));
     const working = rows.filter(r=>r.ok).length;
     // ?format=text -> phone par padhne layak: har provider ki ek line
     if (req.query.format === 'text') {
       const lines = rows.map(r => `${r.ok ? 'OK  ' : 'FAIL'} ${String(r.provider).padEnd(13)} streams=${String(r.count).padEnd(3)} ${String(r.ms ?? '-').padStart(6)}ms  ${r.error ? 'err: ' + r.error : (r.sample ? r.sample.host + ' ' + JSON.stringify(r.byType) : 'koi stream nahi mili')}`);
-      res.type('text/plain').send(`tmdb=${tmdbId} type=${type} imdb=${imdbId || '-'}  working ${working}/${rows.length}\n\n` + lines.join('\n'));
+      const logText = rows.length === 1 && rows[0].logs && rows[0].logs.length ? '\n\n--- provider logs ---\n' + rows[0].logs.join('\n') : '';
+      res.type('text/plain').send(`tmdb=${tmdbId} type=${type} imdb=${imdbId || '-'}  working ${working}/${rows.length}\n\n` + lines.join('\n') + logText);
       return;
     }
     res.json({ success:true, tmdbId, type, imdbId, working, total: rows.length, providers: rows });
